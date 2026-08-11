@@ -53,6 +53,7 @@ async function handleProxyPage(res, requestPath, searchParams) {
       }
 
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet');
       res.setHeader('X-Frame-Options', 'ALLOWALL');
       res.setHeader('Access-Control-Allow-Origin', '*'); 
       return res.status(200).send(html);
