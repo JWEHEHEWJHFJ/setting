@@ -1,39 +1,16 @@
 export default async function handler(req, res) {
-  // Routing parameter (mirip fungsi doGet)
   const { action, path } = req.query;
 
+  // Hanya layani jika ada parameter action=ghfile
   if (action === 'ghfile') {
     return await handleGithubFile(res, path);
   }
 
-  // Default: proxy halaman utama
-  return await handleMainPage(res);
-}
-
-async function handleMainPage(res) {
-  const TARGET_URL = 'https://jwehehewjhfj.github.io/ortu/';
-  
-  try {
-    const response = await fetch(TARGET_URL, { redirect: 'follow' });
-    let html = await response.text();
-
-    // Suntik <base href> dan script anti-devtools
-    if (/<head[^>]*>/i.test(html)) {
-      html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${TARGET_URL}">${DEVTOOLS_GUARD_SCRIPT_}`);
-    } else {
-      html = `<base href="${TARGET_URL}">${DEVTOOLS_GUARD_SCRIPT_}` + html;
-    }
-
-    // Mengizinkan iframe (ALLOWALL)
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
-    
-    return res.status(200).send(html);
-  } catch (err) {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.status(500).send(`<p>Gagal memuat halaman: ${err.message}</p>`);
-  }
+  // Hentikan pemanggilan index.html / halaman utama
+  // Kembalikan status 403 (Forbidden) atau pesan JSON
+  return res.status(403).json({ 
+    error: 'Akses ditolak. Endpoint ini hanya menerima request API yang valid.' 
+  });
 }
 
 async function handleGithubFile(res, filePath) {
@@ -60,7 +37,7 @@ async function handleGithubFile(res, filePath) {
         'Authorization': `Bearer ${token}`,
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'Vercel-Proxy' // GitHub API membutuhkan User-Agent
+        'User-Agent': 'Vercel-Proxy' 
       }
     });
 
@@ -75,93 +52,10 @@ async function handleGithubFile(res, filePath) {
     // Decode base64 dari GitHub
     const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
 
+    // Izinkan akses CORS jika dipanggil dari domain lain
     res.setHeader('Access-Control-Allow-Origin', '*');
     return res.status(200).json({ path: filePath, content: decoded });
   } catch (err) {
     return res.status(500).json({ error: 'Internal Server Error', detail: err.message });
   }
 }
-
-const DEVTOOLS_GUARD_SCRIPT_ = `
-<script>
-(function () {
-  var devtoolsOpen = false;
-  var appAlreadyLoaded = false;
-
-  window.addEventListener('load', function () {
-    setTimeout(function () { appAlreadyLoaded = true; }, 500);
-  });
-
-  function wipeStorage_() {
-    try { sessionStorage.clear(); } catch (e) {}
-    try { localStorage.clear(); } catch (e) {}
-    try { if (window.__APP_DATA__) window.__APP_DATA__ = null; } catch (e) {}
-  }
-
-  function resetApp_() {
-    wipeStorage_();
-    try {
-      document.documentElement.innerHTML =
-        '<body style="margin:0;display:flex;align-items:center;justify-content:center;' +
-        'height:100vh;font-family:sans-serif;background:#111;color:#eee;text-align:center;">' +
-        '<div><h2>Terjadi kesalahan</h2><p>Aplikasi dihentikan.</p></div></body>';
-    } catch (e) {}
-  }
-
-  function blockNetwork_() {
-    window.fetch = function () {
-      return Promise.reject(new Error('Blocked'));
-    };
-    var origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function () {
-      throw new Error('Blocked');
-    };
-  }
-
-  function onDevtoolsDetected_() {
-    if (devtoolsOpen) return;
-    devtoolsOpen = true;
-    blockNetwork_();
-    wipeStorage_();
-    if (appAlreadyLoaded) {
-      resetApp_();
-    }
-  }
-
-  (function loopCheck() {
-    var start = performance.now();
-    debugger;
-    var diff = performance.now() - start;
-    if (diff > 100) {
-      onDevtoolsDetected_();
-    }
-    setTimeout(loopCheck, 800);
-  })();
-
-  setInterval(function () {
-    var threshold = 160;
-    var widthDiff = window.outerWidth - window.innerWidth;
-    var heightDiff = window.outerHeight - window.innerHeight;
-    if (widthDiff > threshold || heightDiff > threshold) {
-      onDevtoolsDetected_();
-    }
-  }, 800);
-
-  document.addEventListener('keydown', function (e) {
-    var key = (e.key || '').toUpperCase();
-    if (
-      key === 'F12' ||
-      (e.ctrlKey && e.shiftKey && (key === 'I' || key === 'J' || key === 'C')) ||
-      (e.metaKey && e.altKey && key === 'I')
-    ) {
-      e.preventDefault();
-      onDevtoolsDetected_();
-    }
-  });
-
-  document.addEventListener('contextmenu', function (e) {
-    e.preventDefault();
-  });
-})();
-</script>
-`;
