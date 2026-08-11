@@ -6,39 +6,76 @@ export default async function handler(req, res) {
     return await handleGithubFile(res, path);
   }
 
-  // 2. Default: Proxy halaman utama (index.html) dan suntik skrip anti-debug
-  return await handleMainPage(res);
+  // 2. Dapatkan path dari request asli (misal: /css/style.css atau /)
+  const urlObj = new URL(req.url, `http://${req.headers.host}`);
+  let requestPath = urlObj.pathname;
+  
+  if (requestPath.startsWith('/')) {
+    requestPath = requestPath.substring(1); // Hapus slash di depan
+  }
+
+  // 3. Proxy halaman utama & semua aset
+  return await handleProxyPage(res, requestPath, urlObj.search);
 }
 
-// Fungsi untuk proksi halaman utama dan menyuntikkan skrip anti-debug
-async function handleMainPage(res) {
-  const TARGET_URL = 'https://jwehehewjhfj.github.io/ortu/';
+// FUNGSI PROXY CERDAS: Meneruskan HTML dan aset (JS, CSS, dll) secara tersembunyi
+async function handleProxyPage(res, requestPath, searchParams) {
+  // AMBIL DARI ENVIRONMENT VARIABLES
+  const TARGET_URL = process.env.TARGET_URL; 
   
-  try {
-    const response = await fetch(TARGET_URL, { redirect: 'follow' });
-    let html = await response.text();
+  if (!TARGET_URL) {
+    return res.status(500).send("Variabel TARGET_URL belum di-set di Vercel");
+  }
 
-    // Suntik <base href> agar SEMUA path relatif (ds.js, /logo.png) diresolve ke domain asli
-    // DAN suntik skrip anti-debug ke dalam <head>
-    if (/<head[^>]*>/i.test(html)) {
-      html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${TARGET_URL}">${DEVTOOLS_GUARD_SCRIPT_}`);
-    } else {
-      html = `<base href="${TARGET_URL}">${DEVTOOLS_GUARD_SCRIPT_}` + html;
+  // Pastikan format URL tergabung dengan benar (hilangkan slash ganda)
+  const cleanBaseUrl = TARGET_URL.replace(/\/$/, "");
+  const fetchUrl = `${cleanBaseUrl}/${requestPath}${searchParams}`;
+
+  try {
+    const response = await fetch(fetchUrl, { redirect: 'follow' });
+    
+    if (!response.ok) {
+      return res.status(response.status).send(`Gagal memuat: ${response.statusText}`);
     }
 
-    // Mengizinkan iframe (ALLOWALL)
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    const contentType = response.headers.get('content-type') || '';
     
-    return res.status(200).send(html);
+    // JIKA YANG DIMINTA ADALAH HALAMAN HTML
+    if (contentType.includes('text/html')) {
+      let html = await response.text();
+      
+      // Kita TIDAK LAGI menyuntikkan <base href> agar URL asli tidak bocor.
+      // Langsung suntik skrip anti-debug ke dalam <head>
+      if (/<head[^>]*>/i.test(html)) {
+        html = html.replace(/<head([^>]*)>/i, `<head$1>${DEVTOOLS_GUARD_SCRIPT_}`);
+      } else {
+        html = `${DEVTOOLS_GUARD_SCRIPT_}` + html;
+      }
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('X-Frame-Options', 'ALLOWALL');
+      res.setHeader('Access-Control-Allow-Origin', '*'); 
+      return res.status(200).send(html);
+    } 
+    // JIKA YANG DIMINTA ADALAH ASET STATIS (CSS, JS, Gambar)
+    else {
+      // Teruskan file apa adanya secara transparan
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      // Cache aset statis agar cepat
+      res.setHeader('Cache-Control', 'public, max-age=3600'); 
+      
+      return res.status(200).send(buffer);
+    }
   } catch (err) {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(500).send(`<p>Gagal memuat halaman: ${err.message}</p>`);
   }
 }
 
-// Fungsi API GitHub (seperti yang dibahas sebelumnya)
+// FUNGSI API GITHUB (Tetap sama)
 async function handleGithubFile(res, filePath) {
   if (!filePath) {
     return res.status(400).json({ error: 'Parameter path wajib diisi' });
@@ -82,7 +119,7 @@ async function handleGithubFile(res, filePath) {
   }
 }
 
-// Skrip JavaScript sisi klien (di-inject) untuk mendeteksi & menghapus konten
+// SKRIP ANTI-DEBUG (Tetap sama, menghapus memori jika F12 ditekan)
 const DEVTOOLS_GUARD_SCRIPT_ = `
 <script>
 (function () {
@@ -93,19 +130,15 @@ const DEVTOOLS_GUARD_SCRIPT_ = `
     setTimeout(function () { appAlreadyLoaded = true; }, 500);
   });
 
-  // Fungsi untuk mengosongkan storage
   function wipeStorage_() {
     try { sessionStorage.clear(); } catch (e) {}
     try { localStorage.clear(); } catch (e) {}
-    // Kosongkan state global jika ada
     try { if (window.__APP_DATA__) window.__APP_DATA__ = null; } catch (e) {}
   }
 
-  // Fungsi UNTUK MENGHAPUS KONTEN HALAMAN
   function resetApp_() {
     wipeStorage_();
     try {
-      // SET HTML KOSONG DENGAN PESAN KESALAHAN
       document.documentElement.innerHTML =
         '<body style="margin:0;display:flex;align-items:center;justify-content:center;' +
         'height:100vh;font-family:sans-serif;background:#111;color:#eee;text-align:center;">' +
@@ -113,65 +146,43 @@ const DEVTOOLS_GUARD_SCRIPT_ = `
     } catch (e) {}
   }
 
-  // Fungsi untuk memblokir permintaan jaringan di masa mendatang
   function blockNetwork_() {
-    window.fetch = function () {
-      return Promise.reject(new Error('Blocked'));
-    };
+    window.fetch = function () { return Promise.reject(new Error('Blocked')); };
     var origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function () {
-      throw new Error('Blocked');
-    };
+    XMLHttpRequest.prototype.open = function () { throw new Error('Blocked'); };
   }
 
-  // Dipanggil saat DevTools dideteksi
   function onDevtoolsDetected_() {
     if (devtoolsOpen) return;
     devtoolsOpen = true;
     blockNetwork_();
-    if (appAlreadyLoaded) {
-      resetApp_(); // HAPUS KONTEN HALAMAN
-    }
+    if (appAlreadyLoaded) resetApp_();
   }
 
-  // Metode 1: Timing trik "debugger" — jika DevTools terbuka, eksekusi debugger akan memakan waktu lebih lama.
   (function loopCheck() {
     var start = performance.now();
-    debugger; // Memperlambat perulangan jika DevTools terbuka
+    debugger; 
     var diff = performance.now() - start;
-    if (diff > 100) {
-      onDevtoolsDetected_();
-    }
+    if (diff > 100) onDevtoolsDetected_();
     setTimeout(loopCheck, 800);
   })();
 
-  // Metode 2: Selisih ukuran window luar vs dalam (indikasi panel DevTools di-dock)
   setInterval(function () {
     var threshold = 160;
     var widthDiff = window.outerWidth - window.innerWidth;
     var heightDiff = window.outerHeight - window.innerHeight;
-    if (widthDiff > threshold || heightDiff > threshold) {
-      onDevtoolsDetected_();
-    }
+    if (widthDiff > threshold || heightDiff > threshold) onDevtoolsDetected_();
   }, 800);
 
-  // Metode 3: Shortcut umum (F12, dll.) -> langsung blok proaktif
   document.addEventListener('keydown', function (e) {
     var key = (e.key || '').toUpperCase();
-    if (
-      key === 'F12' ||
-      (e.ctrlKey && e.shiftKey && (key === 'I' || key === 'J' || key === 'C')) ||
-      (e.metaKey && e.altKey && key === 'I')
-    ) {
+    if (key === 'F12' || (e.ctrlKey && e.shiftKey && (key === 'I' || key === 'J' || key === 'C')) || (e.metaKey && e.altKey && key === 'I')) {
       e.preventDefault();
       onDevtoolsDetected_();
     }
   });
 
-  // Opsional: Blok klik kanan (inspect element)
-  document.addEventListener('contextmenu', function (e) {
-    e.preventDefault();
-  });
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 })();
 </script>
 `;
