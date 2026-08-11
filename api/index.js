@@ -6,28 +6,48 @@ export default async function handler(req, res) {
     return await handleGithubFile(res, path);
   }
 
-  // 2. Dapatkan path dari request asli (misal: /css/style.css atau /)
+  // 2. Dapatkan path dari request asli
   const urlObj = new URL(req.url, `http://${req.headers.host}`);
-  let requestPath = urlObj.pathname;
-  
-  if (requestPath.startsWith('/')) {
-    requestPath = requestPath.substring(1); // Hapus slash di depan
-  }
+  let requestPath = urlObj.pathname.replace(/^\//, '');
 
   // 3. Proxy halaman utama & semua aset
   return await handleProxyPage(res, requestPath, urlObj.search);
 }
 
-// FUNGSI PROXY CERDAS: Meneruskan HTML dan aset (JS, CSS, dll) secara tersembunyi
+// FUNGSI PENGACAK HTML (SERVER-SIDE OBFUSCATOR)
+function obfuscateHTML(htmlString) {
+  // Ubah seluruh HTML menjadi string Base64 aman (UTF-8)
+  const base64Payload = Buffer.from(htmlString, 'utf-8').toString('base64');
+
+  // Kembalikan dokumen pembungkus yang mendeskripsi HTML di memori browser
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script>
+    (function() {
+      var payload = "${base64Payload}";
+      var decoded = decodeURIComponent(escape(window.atob(payload)));
+      document.open();
+      document.write(decoded);
+      document.close();
+    })();
+  </script>
+</head>
+<body>
+  <noscript>JavaScript diperlukan untuk membuka halaman ini.</noscript>
+</body>
+</html>`;
+}
+
+// FUNGSI PROXY DENGAN PEMBERSIH URL & OBFUSCATION
 async function handleProxyPage(res, requestPath, searchParams) {
-  // AMBIL DARI ENVIRONMENT VARIABLES
   const TARGET_URL = process.env.TARGET_URL; 
   
   if (!TARGET_URL) {
     return res.status(500).send("Variabel TARGET_URL belum di-set di Vercel");
   }
 
-  // Pastikan format URL tergabung dengan benar (hilangkan slash ganda)
   const cleanBaseUrl = TARGET_URL.replace(/\/$/, "");
   const fetchUrl = `${cleanBaseUrl}/${requestPath}${searchParams}`;
 
@@ -39,34 +59,47 @@ async function handleProxyPage(res, requestPath, searchParams) {
     }
 
     const contentType = response.headers.get('content-type') || '';
-    
-    // JIKA YANG DIMINTA ADALAH HALAMAN HTML
-    if (contentType.includes('text/html')) {
-      let html = await response.text();
-      
-      // Kita TIDAK LAGI menyuntikkan <base href> agar URL asli tidak bocor.
-      // Langsung suntik skrip anti-debug ke dalam <head>
-      if (/<head[^>]*>/i.test(html)) {
-        html = html.replace(/<head([^>]*)>/i, `<head$1>${DEVTOOLS_GUARD_SCRIPT_}`);
-      } else {
-        html = `${DEVTOOLS_GUARD_SCRIPT_}` + html;
+
+    // JIKA RESPONSE BERUPA TEKS (HTML, JS, CSS, JSON)
+    if (
+      contentType.includes('text/html') || 
+      contentType.includes('application/javascript') || 
+      contentType.includes('text/css') ||
+      contentType.includes('application/json')
+    ) {
+      let content = await response.text();
+
+      // Clean/Replace jalur hardcoded GitHub Pages
+      const urlPatternWithSlash = new RegExp(`${cleanBaseUrl}/`, 'g');
+      const urlPatternWithoutSlash = new RegExp(`${cleanBaseUrl}`, 'g');
+
+      content = content.replace(urlPatternWithSlash, '/');
+      content = content.replace(urlPatternWithoutSlash, '');
+
+      // Jika file HTML: suntik skrip anti-debug DULU, lalu ACAK (obfuscate) seluruh kodenya
+      if (contentType.includes('text/html')) {
+        if (/<head[^>]*>/i.test(content)) {
+          content = content.replace(/<head([^>]*)>/i, `<head$1>${DEVTOOLS_GUARD_SCRIPT_}`);
+        } else {
+          content = DEVTOOLS_GUARD_SCRIPT_ + content;
+        }
+
+        // Jalankan fitur obfuscation di sini
+        content = obfuscateHTML(content);
       }
 
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet');
+      res.setHeader('Content-Type', contentType);
       res.setHeader('X-Frame-Options', 'ALLOWALL');
       res.setHeader('Access-Control-Allow-Origin', '*'); 
-      return res.status(200).send(html);
+      return res.status(200).send(content);
     } 
-    // JIKA YANG DIMINTA ADALAH ASET STATIS (CSS, JS, Gambar)
+    // JIKA RESPONSE BERUPA BINER (Gambar, Font, dll)
     else {
-      // Teruskan file apa adanya secara transparan
       const arrayBuffer = await response.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
       
       res.setHeader('Content-Type', contentType);
       res.setHeader('Access-Control-Allow-Origin', '*');
-      // Cache aset statis agar cepat
       res.setHeader('Cache-Control', 'public, max-age=3600'); 
       
       return res.status(200).send(buffer);
@@ -76,7 +109,7 @@ async function handleProxyPage(res, requestPath, searchParams) {
   }
 }
 
-// FUNGSI API GITHUB (Tetap sama)
+// FUNGSI API GITHUB
 async function handleGithubFile(res, filePath) {
   if (!filePath) {
     return res.status(400).json({ error: 'Parameter path wajib diisi' });
@@ -120,7 +153,7 @@ async function handleGithubFile(res, filePath) {
   }
 }
 
-// SKRIP ANTI-DEBUG (Tetap sama, menghapus memori jika F12 ditekan)
+// SKRIP ANTI-DEBUG
 const DEVTOOLS_GUARD_SCRIPT_ = `
 <script>
 (function () {
