@@ -1,6 +1,0 @@
-{
-  "rewrites": [
-    { "source": "/", "destination": "https://jwehehewjhfj.github.io/ortu/" },
-    { "source": "/:path*", "destination": "https://jwehehewjhfj.github.io/ortu/:path*" }
-  ]
-}
