@@ -40,7 +40,7 @@ function obfuscateHTML(htmlString) {
 </html>`;
 }
 
-// FUNGSI PROXY DENGAN PEMBERSIH URL, OBFUSCATION & CACHING
+// FUNGSI PROXY DENGAN PEMBERSIH URL & OBFUSCATION
 async function handleProxyPage(res, requestPath, searchParams) {
   const TARGET_URL = process.env.TARGET_URL; 
   
@@ -88,17 +88,10 @@ async function handleProxyPage(res, requestPath, searchParams) {
         content = obfuscateHTML(content);
       }
 
-      // Security Headers Ekstra
       res.setHeader('Content-Type', contentType);
-      res.setHeader('X-Frame-Options', 'DENY'); // Cegah iframing dari web lain
-      res.setHeader('Content-Security-Policy', "frame-ancestors 'none'; object-src 'none';");
-      res.setHeader('X-Content-Type-Options', 'nosniff');
+      // PERUBAHAN DI SINI: Mengganti X-Frame-Options dengan CSP yang modern
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
       res.setHeader('Access-Control-Allow-Origin', '*'); 
-      
-      // VERCEL EDGE CACHING (Sangat Penting untuk menghemat Invocations)
-      // Cache di CDN Vercel selama 24 jam (86400 detik), update di background (stale-while-revalidate)
-      res.setHeader('Cache-Control', 'public, s-maxage=86400, stale-while-revalidate=2592000');
-      
       return res.status(200).send(content);
     } 
     // JIKA RESPONSE BERUPA BINER (Gambar, Font, dll)
@@ -108,9 +101,9 @@ async function handleProxyPage(res, requestPath, searchParams) {
       
       res.setHeader('Content-Type', contentType);
       res.setHeader('Access-Control-Allow-Origin', '*');
-      
-      // VERCEL EDGE CACHING UNTUK ASSET (Menghemat invocations dari muatan gambar/font)
-      res.setHeader('Cache-Control', 'public, s-maxage=86400, stale-while-revalidate=2592000'); 
+      // PERUBAHAN DI SINI: Menambahkan CSP untuk aset biner juga
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
+      res.setHeader('Cache-Control', 'public, max-age=3600'); 
       
       return res.status(200).send(buffer);
     }
@@ -119,7 +112,7 @@ async function handleProxyPage(res, requestPath, searchParams) {
   }
 }
 
-// FUNGSI API GITHUB DENGAN CACHING
+// FUNGSI API GITHUB
 async function handleGithubFile(res, filePath) {
   if (!filePath) {
     return res.status(400).json({ error: 'Parameter path wajib diisi' });
@@ -157,10 +150,6 @@ async function handleGithubFile(res, filePath) {
     const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
 
     res.setHeader('Access-Control-Allow-Origin', '*');
-    
-    // CACHING GITHUB API (Agar quota API GitHub aman & Invocations turun)
-    res.setHeader('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=86400');
-    
     return res.status(200).json({ path: filePath, content: decoded });
   } catch (err) {
     return res.status(500).json({ error: 'Internal Server Error', detail: err.message });
