@@ -1,3 +1,33 @@
+// ============================================================
+// KONFIGURASI CACHE
+// ============================================================
+// Cache disimpan di memory module (bertahan selama instance
+// serverless Vercel masih "warm"). Ini mengurangi jumlah request
+// ke GitHub Pages / GitHub API meskipun user reload berkali-kali
+// dalam rentang waktu TTL di bawah ini.
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 menit
+
+// Cache untuk halaman/aset hasil proxy (key: requestPath + search)
+const pageCache = new Map();
+// Cache untuk hasil handleGithubFile (key: filePath)
+const ghFileCache = new Map();
+
+function getFromCache(cache, key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function setCache(cache, key, value) {
+  cache.set(key, { ...value, timestamp: Date.now() });
+}
+
+// ============================================================
+
 export default async function handler(req, res) {
   const { action, path } = req.query;
 
@@ -40,12 +70,27 @@ function obfuscateHTML(htmlString) {
 </html>`;
 }
 
-// FUNGSI PROXY DENGAN PEMBERSIH URL & OBFUSCATION
+// FUNGSI PROXY DENGAN PEMBERSIH URL & OBFUSCATION (+ CACHE 5 MENIT)
 async function handleProxyPage(res, requestPath, searchParams) {
-  const TARGET_URL = process.env.TARGET_URL; 
-  
+  const TARGET_URL = process.env.TARGET_URL;
+
   if (!TARGET_URL) {
     return res.status(500).send("Variabel TARGET_URL belum di-set di Vercel");
+  }
+
+  const cacheKey = `${requestPath}${searchParams}`;
+
+  // --- CEK CACHE DULU ---
+  const cached = getFromCache(pageCache, cacheKey);
+  if (cached) {
+    res.setHeader('Content-Type', cached.contentType);
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('X-Cache', 'HIT');
+    if (cached.isBinary) {
+      return res.status(200).send(Buffer.from(cached.body, 'base64'));
+    }
+    return res.status(200).send(cached.body);
   }
 
   const cleanBaseUrl = TARGET_URL.replace(/\/$/, "");
@@ -53,7 +98,7 @@ async function handleProxyPage(res, requestPath, searchParams) {
 
   try {
     const response = await fetch(fetchUrl, { redirect: 'follow' });
-    
+
     if (!response.ok) {
       return res.status(response.status).send(`Gagal memuat: ${response.statusText}`);
     }
@@ -62,8 +107,8 @@ async function handleProxyPage(res, requestPath, searchParams) {
 
     // JIKA RESPONSE BERUPA TEKS (HTML, JS, CSS, JSON)
     if (
-      contentType.includes('text/html') || 
-      contentType.includes('application/javascript') || 
+      contentType.includes('text/html') ||
+      contentType.includes('application/javascript') ||
       contentType.includes('text/css') ||
       contentType.includes('application/json')
     ) {
@@ -88,23 +133,29 @@ async function handleProxyPage(res, requestPath, searchParams) {
         content = obfuscateHTML(content);
       }
 
+      // --- SIMPAN KE CACHE ---
+      setCache(pageCache, cacheKey, { contentType, body: content, isBinary: false });
+
       res.setHeader('Content-Type', contentType);
-      // PERUBAHAN DI SINI: Mengganti X-Frame-Options dengan CSP yang modern
       res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
-      res.setHeader('Access-Control-Allow-Origin', '*'); 
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('X-Cache', 'MISS');
       return res.status(200).send(content);
-    } 
+    }
     // JIKA RESPONSE BERUPA BINER (Gambar, Font, dll)
     else {
       const arrayBuffer = await response.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
-      
+
+      // --- SIMPAN KE CACHE (base64 karena Map menyimpan objek biasa) ---
+      setCache(pageCache, cacheKey, { contentType, body: buffer.toString('base64'), isBinary: true });
+
       res.setHeader('Content-Type', contentType);
       res.setHeader('Access-Control-Allow-Origin', '*');
-      // PERUBAHAN DI SINI: Menambahkan CSP untuk aset biner juga
       res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
-      res.setHeader('Cache-Control', 'public, max-age=3600'); 
-      
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('X-Cache', 'MISS');
+
       return res.status(200).send(buffer);
     }
   } catch (err) {
@@ -112,10 +163,18 @@ async function handleProxyPage(res, requestPath, searchParams) {
   }
 }
 
-// FUNGSI API GITHUB
+// FUNGSI API GITHUB (+ CACHE 5 MENIT)
 async function handleGithubFile(res, filePath) {
   if (!filePath) {
     return res.status(400).json({ error: 'Parameter path wajib diisi' });
+  }
+
+  // --- CEK CACHE DULU ---
+  const cached = getFromCache(ghFileCache, filePath);
+  if (cached) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('X-Cache', 'HIT');
+    return res.status(200).json({ path: filePath, content: cached.content });
   }
 
   const token = process.env.GITHUB_TOKEN;
@@ -136,7 +195,7 @@ async function handleGithubFile(res, filePath) {
         'Authorization': `Bearer ${token}`,
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'Vercel-Proxy' 
+        'User-Agent': 'Vercel-Proxy'
       }
     });
 
@@ -149,7 +208,11 @@ async function handleGithubFile(res, filePath) {
     const data = await response.json();
     const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
 
+    // --- SIMPAN KE CACHE ---
+    setCache(ghFileCache, filePath, { content: decoded });
+
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('X-Cache', 'MISS');
     return res.status(200).json({ path: filePath, content: decoded });
   } catch (err) {
     return res.status(500).json({ error: 'Internal Server Error', detail: err.message });
@@ -198,7 +261,7 @@ const DEVTOOLS_GUARD_SCRIPT_ = `
 
   (function loopCheck() {
     var start = performance.now();
-    debugger; 
+    debugger;
     var diff = performance.now() - start;
     if (diff > 100) onDevtoolsDetected_();
     setTimeout(loopCheck, 800);
