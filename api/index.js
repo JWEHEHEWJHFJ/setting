@@ -26,6 +26,19 @@ function setCache(cache, key, value) {
   cache.set(key, { ...value, timestamp: Date.now() });
 }
 
+// Halaman/aset di-fetch client dengan cache-buster "?v=<timestamp>" (cache: no-store)
+// supaya browser tidak nyimpen versi lama. Tapi itu bikin tiap request punya
+// searchParams yang selalu beda -> cache key di server jadi selalu MISS kalau
+// dihitung apa adanya. Maka param "v" dibuang dulu sebelum dijadikan cache key,
+// parameter lain (kalau ada) tetap dipertahankan.
+function buildCacheKey(requestPath, searchParams) {
+  if (!searchParams) return requestPath;
+  const params = new URLSearchParams(searchParams);
+  params.delete('v');
+  const rest = params.toString();
+  return rest ? `${requestPath}?${rest}` : requestPath;
+}
+
 // ============================================================
 
 export default async function handler(req, res) {
@@ -78,15 +91,19 @@ async function handleProxyPage(res, requestPath, searchParams) {
     return res.status(500).send("Variabel TARGET_URL belum di-set di Vercel");
   }
 
-  const cacheKey = `${requestPath}${searchParams}`;
+  const cacheKey = buildCacheKey(requestPath, searchParams);
 
   // --- CEK CACHE DULU ---
   const cached = getFromCache(pageCache, cacheKey);
   if (cached) {
+    const ageMs = Date.now() - cached.timestamp;
+    const remainingMs = Math.max(0, CACHE_TTL_MS - ageMs);
     res.setHeader('Content-Type', cached.contentType);
     res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('X-Cache', 'HIT');
+    // Beri tahu client kapan cache ini akan kedaluwarsa (dipakai untuk auto-reload di index.html)
+    res.setHeader('X-Cache-Expires-In', String(remainingMs));
     if (cached.isBinary) {
       return res.status(200).send(Buffer.from(cached.body, 'base64'));
     }
@@ -140,6 +157,7 @@ async function handleProxyPage(res, requestPath, searchParams) {
       res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('X-Cache', 'MISS');
+      res.setHeader('X-Cache-Expires-In', String(CACHE_TTL_MS));
       return res.status(200).send(content);
     }
     // JIKA RESPONSE BERUPA BINER (Gambar, Font, dll)
@@ -219,12 +237,15 @@ async function handleGithubFile(res, filePath) {
   }
 }
 
-// SKRIP ANTI-DEBUG
+// SKRIP ANTI-DEBUG (dengan lockout 5 menit, bukan wipe permanen)
 const DEVTOOLS_GUARD_SCRIPT_ = `
 <script>
 (function () {
+  var LOCK_KEY = 'sp5p_lockout_until';
+  var LOCK_MS  = 5 * 60 * 1000; // 5 menit
   var devtoolsOpen = false;
   var appAlreadyLoaded = false;
+  var lockTicking = false;
 
   window.addEventListener('load', function () {
     setTimeout(function () { appAlreadyLoaded = true; }, 500);
@@ -232,32 +253,78 @@ const DEVTOOLS_GUARD_SCRIPT_ = `
 
   function wipeStorage_() {
     try { sessionStorage.clear(); } catch (e) {}
-    try { localStorage.clear(); } catch (e) {}
+    try { localStorage.removeItem('sp5p_session'); } catch (e) {}
     try { if (window.__APP_DATA__) window.__APP_DATA__ = null; } catch (e) {}
-  }
-
-  function resetApp_() {
-    wipeStorage_();
-    try {
-      document.documentElement.innerHTML =
-        '<body style="margin:0;display:flex;align-items:center;justify-content:center;' +
-        'height:100vh;font-family:sans-serif;background:#111;color:#eee;text-align:center;">' +
-        '<div><h2>Akses Ditolak</h2><p>Halaman ini telah dihapus dari memori Anda karena Alat Pengembang terdeteksi.</p></div></body>';
-    } catch (e) {}
   }
 
   function blockNetwork_() {
     window.fetch = function () { return Promise.reject(new Error('Blocked')); };
-    var origOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function () { throw new Error('Blocked'); };
+  }
+
+  function fmt_(ms) {
+    var totalSec = Math.max(0, Math.ceil(ms / 1000));
+    var m = Math.floor(totalSec / 60);
+    var s = totalSec % 60;
+    return m + ' menit ' + (s < 10 ? '0' : '') + s + ' detik';
+  }
+
+  function showLockScreen_(untilTs) {
+    try {
+      document.documentElement.innerHTML =
+        '<body style="margin:0;display:flex;align-items:center;justify-content:center;' +
+        'height:100vh;font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:24px;box-sizing:border-box;">' +
+        '<div><h2 style="margin-bottom:12px;">Maaf, Anda mencoba melakukan kesalahan</h2>' +
+        '<p style="opacity:.8;margin-bottom:6px;">Akses sementara dibatasi. Silakan coba lagi dalam:</p>' +
+        '<p id="sp5p-lock-timer" style="font-size:1.4em;font-weight:700;">' + fmt_(untilTs - Date.now()) + '</p></div></body>';
+    } catch (e) {}
+
+    if (lockTicking) return;
+    lockTicking = true;
+    (function tick() {
+      var remaining = untilTs - Date.now();
+      var el = document.getElementById('sp5p-lock-timer');
+      if (remaining <= 0) {
+        try { localStorage.removeItem(LOCK_KEY); } catch (e) {}
+        location.reload();
+        return;
+      }
+      if (el) el.textContent = fmt_(remaining);
+      setTimeout(tick, 1000);
+    })();
+  }
+
+  function triggerLockout_() {
+    var until = Date.now() + LOCK_MS;
+    try { localStorage.setItem(LOCK_KEY, String(until)); } catch (e) {}
+    blockNetwork_();
+    wipeStorage_();
+    showLockScreen_(until);
+  }
+
+  function checkExistingLockout_() {
+    var until = 0;
+    try { until = parseInt(localStorage.getItem(LOCK_KEY) || '0', 10); } catch (e) {}
+    if (until && until > Date.now()) {
+      devtoolsOpen = true;
+      blockNetwork_();
+      showLockScreen_(until);
+      return true;
+    }
+    return false;
   }
 
   function onDevtoolsDetected_() {
     if (devtoolsOpen) return;
     devtoolsOpen = true;
-    blockNetwork_();
-    if (appAlreadyLoaded) resetApp_();
+    if (appAlreadyLoaded) {
+      triggerLockout_();
+    } else {
+      blockNetwork_();
+    }
   }
+
+  if (checkExistingLockout_()) return;
 
   (function loopCheck() {
     var start = performance.now();
