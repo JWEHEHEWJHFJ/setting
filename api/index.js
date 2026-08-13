@@ -93,7 +93,7 @@ async function handleProxyPage(res, requestPath, searchParams) {
 
   const cacheKey = buildCacheKey(requestPath, searchParams);
 
-  // --- CEK CACHE DULU ---
+  // --- CEK CACHE DULU (lapisan cadangan per-instance; lapisan utama ada di Edge Vercel via s-maxage) ---
   const cached = getFromCache(pageCache, cacheKey);
   if (cached) {
     const ageMs = Date.now() - cached.timestamp;
@@ -101,6 +101,11 @@ async function handleProxyPage(res, requestPath, searchParams) {
     res.setHeader('Content-Type', cached.contentType);
     res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
     res.setHeader('Access-Control-Allow-Origin', '*');
+    // s-maxage: Vercel Edge Network boleh nyimpen & jawab langsung tanpa
+    // manggil function ini lagi, selama sisa waktu di bawah ini. Ini yang
+    // paling besar ngirit Function Invocations & Edge Requests, karena
+    // request dari SEMUA user (bukan cuma 1 instance) dilayani dari CDN.
+    res.setHeader('Cache-Control', `public, max-age=0, s-maxage=${Math.ceil(remainingMs / 1000)}, stale-while-revalidate=60`);
     res.setHeader('X-Cache', 'HIT');
     // Beri tahu client kapan cache ini akan kedaluwarsa (dipakai untuk auto-reload di index.html)
     res.setHeader('X-Cache-Expires-In', String(remainingMs));
@@ -150,12 +155,14 @@ async function handleProxyPage(res, requestPath, searchParams) {
         content = obfuscateHTML(content);
       }
 
-      // --- SIMPAN KE CACHE ---
+      // --- SIMPAN KE CACHE (lapisan cadangan per-instance) ---
       setCache(pageCache, cacheKey, { contentType, body: content, isBinary: false });
 
       res.setHeader('Content-Type', contentType);
       res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
       res.setHeader('Access-Control-Allow-Origin', '*');
+      // --- LAPISAN UTAMA: cache di Edge Network Vercel selama CACHE_TTL_MS ---
+      res.setHeader('Cache-Control', `public, max-age=0, s-maxage=${Math.ceil(CACHE_TTL_MS / 1000)}, stale-while-revalidate=60`);
       res.setHeader('X-Cache', 'MISS');
       res.setHeader('X-Cache-Expires-In', String(CACHE_TTL_MS));
       return res.status(200).send(content);
@@ -171,7 +178,8 @@ async function handleProxyPage(res, requestPath, searchParams) {
       res.setHeader('Content-Type', contentType);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.blogspot.com https://www.sman5pinrang.my.id https://sman5pinrang.my.id;");
-      res.setHeader('Cache-Control', 'public, max-age=3600');
+      // Aset biner (gambar/font) jarang berubah -> cache lebih lama di Edge & browser
+      res.setHeader('Cache-Control', 'public, max-age=0, s-maxage=3600, stale-while-revalidate=86400');
       res.setHeader('X-Cache', 'MISS');
 
       return res.status(200).send(buffer);
