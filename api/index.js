@@ -1,4 +1,46 @@
 // ============================================================
+// KONFIGURASI RATE LIMIT (lapisan cadangan; lapisan utama = Vercel Firewall
+// Rate Limit Rule yang dipasang lewat dashboard, karena itu jalan SEBELUM
+// function ini dipanggil dan tidak makan kuota sama sekali kalau kena block).
+// Rate limit di sini bersifat per-instance (bukan global lintas semua
+// instance/region Vercel), jadi anggap ini sebagai jaring pengaman kedua,
+// bukan pengganti Firewall Rule di dashboard.
+// ============================================================
+const RATE_LIMIT_WINDOW_MS = 10 * 1000; // jendela hitung: 10 detik
+const RATE_LIMIT_MAX = 20;              // maksimal 20 request per IP per jendela
+const ipHits = new Map();
+
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return xff.split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+// Return true kalau IP ini sedang melebihi limit (harus ditolak).
+function isRateLimited(ip) {
+  const now = Date.now();
+  let entry = ipHits.get(ip);
+
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    // Jendela baru untuk IP ini
+    entry = { count: 1, windowStart: now };
+    ipHits.set(ip, entry);
+
+    // Bersih-bersih ringan supaya Map tidak membengkak tanpa batas kalau
+    // banyak IP unik yang pernah mampir (sekolah dengan ratusan siswa).
+    if (ipHits.size > 5000) {
+      for (const [key, val] of ipHits) {
+        if (now - val.windowStart > RATE_LIMIT_WINDOW_MS * 2) ipHits.delete(key);
+      }
+    }
+    return false;
+  }
+
+  entry.count += 1;
+  return entry.count > RATE_LIMIT_MAX;
+}
+
+// ============================================================
 // KONFIGURASI CACHE
 // ============================================================
 // Cache disimpan di memory module (bertahan selama instance
@@ -42,6 +84,13 @@ function buildCacheKey(requestPath, searchParams) {
 // ============================================================
 
 export default async function handler(req, res) {
+  // --- CEK RATE LIMIT DULU (paling awal, sebelum kerja apa pun) ---
+  const clientIp = getClientIp(req);
+  if (isRateLimited(clientIp)) {
+    res.setHeader('Retry-After', String(Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)));
+    return res.status(429).send('Terlalu banyak permintaan dari perangkat Anda. Silakan coba lagi beberapa saat.');
+  }
+
   const { action, path } = req.query;
 
   // 1. Layani request API GitHub jika ada parameter action=ghfile
